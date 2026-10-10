@@ -1,0 +1,55 @@
+name: Deploy
+
+# Builds the analyzer image, pushes it to ECR and rolls it out to EKS.
+# Runs only once the repository variables below are configured:
+#   AWS_DEPLOY_ROLE_ARN  terraform output github_deploy_role_arn
+#   AWS_REGION           terraform output region
+#   EKS_CLUSTER_NAME     terraform output cluster_name
+
+on:
+  push:
+    branches: [main]
+    paths: ["app/**", "k8s/**", ".github/workflows/deploy.yml"]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: vars.AWS_DEPLOY_ROLE_ARN != ''
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      CLUSTER_NAME: ${{ vars.EKS_CLUSTER_NAME }}
+      ECR_REPOSITORY: aiops/analyzer
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push image
+        env:
+          IMAGE: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+        run: |
+          docker build -t "$IMAGE" app
+          docker push "$IMAGE"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+
+      - name: Deploy to EKS
+        run: |
+          aws eks update-kubeconfig --region "$AWS_REGION" --name "$CLUSTER_NAME"
+          (cd k8s && kustomize edit set image "analyzer=$IMAGE")
+          kubectl apply -k k8s
+          kubectl -n aiops rollout status deployment/analyzer --timeout=180s
